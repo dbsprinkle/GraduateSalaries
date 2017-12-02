@@ -1,0 +1,287 @@
+--- 
+title: "Salaries of Graduates" 
+author: Office of Institutional Assessment and Research
+date: 12/2/2017
+header-includes:
+   - \usepackage{hyperref}
+output: pdf_document
+--- 
+
+```{r setup, include=FALSE}
+
+# Not actually needed, but I left it in for future reference
+
+knitr::opts_chunk$set(echo = FALSE)
+
+# https://stackoverflow.com/questions/44399048/hide-comments-in-r-markdown
+hook_in <- function(x, options) {
+    x <- x[!grepl("^%\\s+", x)]
+    paste0("```r\n",
+          paste0(x, collapse="\n"),
+          "\n```")
+}
+knitr::knit_hooks$set(source = hook_in)
+```
+
+```{r functions, include=FALSE}
+# A function for captioning and referencing images
+# c.f. https://stackoverflow.com/questions/31064353/how-to-make-a-figure-caption-in-rmarkdown
+fig <- local({
+    i <- 0
+    ref <- list()
+    list(
+        cap=function(refName, text) {
+            i <<- i + 1
+            ref[[refName]] <<- i
+            paste("Figure ", i, ": ", text, sep="")
+        },
+        ref=function(refName) {
+            ref[[refName]]
+        })
+})
+``` 
+
+```{r data, include=FALSE}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(ggthemes)
+library(xtable)
+
+# set your IPEDS unitID here
+myunitID <- 218070
+
+setwd("C:/Users/deubanks/Box Sync/IR Work/Salary")
+
+comp <- read.csv("IPEDS completions/c2005_IPEDS_Completions.csv", as.is = TRUE)
+comp <- comp %>% filter(awlevel == 5, CIP < 99) %>% select(unitid,CIP,crace15,crace16) %>% mutate(Total = crace15+crace16)
+comp$CIP <- floor(comp$CIP) # drop the details
+
+# get median earnings by major
+earnings <- read.csv("Earnings by Major/CIP and Earnings.csv", as.is = TRUE)
+
+comp <- comp %>% left_join(earnings)
+comp$counted <- 1
+comp$counted[is.na(comp$MedianEarnings)] <- 0
+
+# find the rate at which we cover the graduates, and filter to 80%+ if desired
+comp_counted <- comp %>% group_by(unitid,counted) %>% summarize(N = sum(Total)) %>% spread(counted,N, sep="_") %>% 
+  mutate(Rate = counted_1/(counted_0+counted_1)) #%>% filter(Rate >= .80)
+
+# filter the data to these and average earnings
+comp_avg <- comp %>% inner_join(comp_counted) %>% group_by(unitid) %>% 
+  summarize(InstEarnings = weighted.mean(MedianEarnings,Total, na.rm= TRUE)) %>% filter(InstEarnings > 0)
+
+### get earnings by family income
+fam <- read.csv("Equality Project/mrc_table1.csv",as.is = TRUE) %>% select(c(1,2,5,6))
+names(fam) <- c("Ccode","Name","ParentInc","StudentInc")
+fam$Ccode <- as.integer(fam$Ccode)
+
+# add ipeds ID
+ids <- read.csv("IPEDS_OPE.csv")
+fam <- fam %>% left_join(ids) %>% left_join(comp_avg)
+
+# filter out ones with no data
+fam <- fam %>% filter(!is.na(InstEarnings))
+
+# add peer list
+peer <- read.csv("Peer Lookup/Reverse-Peer-Lookup-2015.csv", as.is = TRUE) %>% select(unitid = 1, ID = 4) %>%      filter(ID == myunitID) %>% select(unitid) %>% mutate(Peer = 1)
+
+fam <- fam %>% left_join(peer) 
+fam$Peer[is.na(fam$Peer)] <- 0
+fam$Peer[fam$unitid == myunitID] <- 1 # include self in peer list
+
+# grab institution name for plot titles
+myName <- paste0(" ",fam$Name[fam$unitid == myunitID]) # the space is a hack so sorted categories are consistent
+
+# add in characteristics
+char <- read.csv("IPEDS Completions/hd2005_IPEDS_Directory.csv", as.is = TRUE) %>% select(unitid,Type = ccbasic,StateAbbr = stabbr)
+fam <- fam %>% left_join(char) %>% filter(Type < 23, Type > 14)
+
+# add state median income
+state <- read.csv("State Data/Median Family Income.csv", as.is = TRUE)
+fam <- fam %>% left_join(state)
+
+# create a category variable
+fam$Category <- "Four Year Degrees"
+fam$Category[fam$Type == 21] <- "Liberal Arts"
+fam$Category[fam$Peer == 1] <- "Peers"
+fam$Category[fam$unitid == myunitID] <- myName
+fam$Category <- as.factor(fam$Category)
+
+peer_list <- as.data.frame(fam$Name[fam$Category=="Peers"])
+names(peer_list) <- c("Name")
+
+# create a peer comparison table
+peer_earnings <- fam %>% filter(Peer == 1) %>% select(Name, ParentInc, InstEarnings, StateInc, StudentInc) %>% arrange(-StudentInc)
+fp <- fam$ParentInc[fam$unitid == myunitID]
+fe <- fam$InstEarnings[fam$unitid == myunitID]
+fs <- fam$Student[fam$unitid == myunitID]
+ft <- fam$StateInc[fam$unitid == myunitID]
+peer_earnings$InstEarnings <- paste0(round((peer_earnings$InstEarnings - fe)/fe * 100),"%")
+peer_earnings$StudentInc <- paste0(round((peer_earnings$StudentInc - fs)/fs *100),"%")
+peer_earnings$ParentInc <- paste0(round((peer_earnings$ParentInc - fp)/fp *100),"%")
+peer_earnings$StateInc<- paste0(round((peer_earnings$StateInc - ft)/ft *100),"%")
+
+#### Correlations
+
+c <- fam %>% select(StudentInc,ParentInc,InstEarnings,StateInc) %>% cor
+c[upper.tri(c)] <- NA
+
+##### regression with just family income
+m1 <- lm(scale(StudentInc) ~ 0 + scale(ParentInc),data = fam)
+m1us <- lm(StudentInc ~ ParentInc,data = fam)
+resid1 <- paste0('$',as.integer(residuals(m1us)[fam$Category == myName]))
+
+### Regression with both inputs
+m2 <- lm(scale(StudentInc)  ~ 0 + scale(InstEarnings),data = fam)
+summary(m2)
+
+########### now adding state income
+m3 <- lm(scale(StudentInc)  ~ 0 + scale(ParentInc) + scale(InstEarnings) + scale(StateInc),data = fam)
+m3us <- lm(StudentInc  ~  ParentInc + InstEarnings + StateInc,data = fam)
+resid3 <- paste0('$',as.integer(residuals(m3us)[fam$Category == myName]))
+summary(m3)
+fam$ModelEstimate <- fitted(m3)
+# note --sqrt link didn't help
+
+######### hand-roll a mixed model for peers -- not shown
+m4 <- lm(scale(StudentInc)  ~ 0 + scale(ParentInc) + scale(StateInc) + Peer + scale(InstEarnings)*Peer,data = fam)
+summary(m4)
+fam$ModelEstimate4 <- fitted(m4)
+
+```
+\begin{abstract}
+   This internal report models the salaries of `r myName` ten years after graduation to try to account for an apparent lag behind peer institutions. Explanatory variables are parental family incomes, types of major programs offered and concommitant average earnings of those, and geographic location. 
+\end{abstract}
+
+\section{Introduction}
+The motivation for this study comes from an article in the \textit{New York Times} \cite{nytmobility} based on research from The Equality of Opportunity Project \cite{mobility}, which links the salaries of college graduates ten years after graduation to the income of their parents. The intent of that research was to understand the economic mobility provided by a college degree. The purpose of this paper is to see how much of that difference we can explain, using three explanatory variables. 
+
+Because of the varying missions of colleges and resulting mix of degree disciplines, some variation in salaries can be ascribed to this distribution. For example, an engineering school and a music school would be expected to have different salary profiles because of the earning potentials of related occupations. Another \textit{New York Times} article \cite{sixmyths} links to a data set \cite{earnings} that we can use for this purpose. This requires downloading completions data from IPEDS \cite{ipeds} and creating weighted averages for each institution by multiplying the number of graduates in a field by the median lifetime earnings associated with that major. This is necessarily approximate because of the limited number of majors that data were provided for. In all, 28 different categories like ENGINEERING and PHILOSOPHY AND RELIGIOUS STUDIES were linked to median earnings. The weighted average was calculated for each institution, resulting in a coverage of `r round(mean(comp_counted$Rate,na.rm=TRUE),2)*100`\% of graduates across all institutions. The missing degree types were omitted from the weighted average.
+
+Finally, the economic influence of the location where graduates find employment probably has an impact. We do not know where graduates settle, but we make the assumption that a significant fraction stay in the U.S. state where their \textit{alma mater} is located. Median family incomes are taken as a proxy for salary variance, and the data came from The U.S. Census Bureau \cite{states}.
+
+In making comparisons to other institutions, we have four levels of association. The broadest useful category includes all institutions that grant four-year degrees, since our focus is on undergraduates. Next is the IPEDS ``Art and Sciences`` designation, which associates with a liberal arts mission. We further refine that to a list of IPEDS peer institutions that we use for comparing faculty salaries. A list of these appears later in this report.  Finally, of course, our institution itself as a category of one.
+
+\section{Analysis}
+Throughout the report we will use the following variable names. 
+
+\begin{itemize}  
+\item $StudentInc$ is the average graduate's salary ten years after graduation.
+\item $ParentInc$ is the average parental family income of students. 
+\item $InstEarnings$ is the weighted averages of predicted earnings based on the mix of majors offered at an institution.
+\item $StateInc$ is the median family income of the state in which an institution resides.
+\end{itemize}
+
+\subsection{Graduate Income Predicted by Parent Income}
+
+The first thing we do is to replicate the graph in the New York Times article, to make sure we have the right data and are using it correctly. 
+
+```{r scatter1, include=TRUE, fig.height = 3,fig.width = 4,results = 'asis', fig.cap=paste("Parent and Student Income")}
+ggplot(fam, aes(x = ParentInc, y = StudentInc)) + geom_point(alpha = .2) + geom_point(data = fam %>% filter(Category == myName), aes(x = ParentInc, y = StudentInc), color = "#FF0000") +
+  geom_smooth(method = "lm", se = FALSE) + theme_base() + 
+  scale_color_manual(values=c("#CCCCCC", "#FF0000", "#888888", "#000066"))
+```
+
+The scatterplot shows all undergraduate institutions with `r myName` marked in red and a linear regression trend line added. The linear model ($R^2$ = `r round(summary(m1)$adj.r.squared,2)`) uses standardized coefficients (meaning means are subtracted and the results divided by the standard deviation), so that the intecept is zero and hence omitted. 
+
+```{r model1,results = 'asis'}
+print(xtable(m1,digits = 2, caption = "$StudentInc \\sim ParentInc$"), comment = FALSE)
+```
+
+This result strongly resembles the original in the New York Times article. The model coeffient tells that that for every standard deviation of parental income, a student benefits by about `r round(coefficients(m1)[1],2)` standard deviations of income, ten years after graduation. The scatterplot shows `r myName` below the trend line with a residual of `r resid1` dollars of annual salary that we will now try to account for.
+
+\subsection{The Effect of Institutional Type}
+Next we include the weighted average of median lifetime earnings using the list of 2006 graduates and their major programs from IPEDS. This results in a single estimate for each institution that we incorporate into the model. Due to the nature of averages we would expect that these estimates would be normally distributed. 
+
+```{r histogram, include=TRUE, fig.height = 3,fig.width = 4,results = 'asis',fig.cap=paste("Estimated Earnings by Four-Year College")}
+hist(fam$InstEarnings, breaks = 50, prob=TRUE)
+curve(dnorm(x, mean=mean(fam$InstEarnings), sd=sd(fam$InstEarnings)), add=TRUE)
+points(fam$InstEarnings[fam$Category == myName ],0, col = "red")
+```
+
+The figure shows that the distribution of estimated lifetime earnings based on the discipline studied is mound-shaped, but has fatter tails than a normal distribution. This is because some institutions have a very focused mission, so that they produce a restricted range of majors. `r myName` is marked as a red dot for comparison. 
+
+The next model considers only the effect of the estimated earnings from institutional degree mixes, to see if this explanatory variable actually explains anything. It turns out to be useful ($R^2$ = `r round(summary(m2)$adj.r.squared,2)`). 
+
+```{r model2, include=TRUE, fig.height = 3,results = 'asis', fig.cap=paste("Graduate Income Modeled by Estimated Earnings of Graduates by Institution.")}
+
+print(xtable(m2,digits = 2, caption = "$StudentInc \\sim InstEarnings$"), comment = FALSE)
+
+ggplot(fam, aes(x = InstEarnings, y = StudentInc, color = Category)) + geom_point(alpha = .7, size = .5) + 
+  geom_smooth(method = "lm", se = FALSE, size = .5) + theme_base() + 
+  scale_color_manual(values=c("#FF0000","#EEEEEE",  "#888888", "#0000ff"))
+```
+The correlation of estimated $InstEarnings$ by institution with with the $ParentInc$ variable is very close to zero ($r=$`r round(cor(fam$ParentInc, fam$InstEarnings),4)`), meaning the two variables are independent and will have cumulative effect on explaining the output variable $StudentInc$ when combined in the same model.
+
+
+```{r peers, include=TRUE, fig.height = 3,fig.width = 4,results = 'asis'}
+cap <- paste("Peer Statistics as Relative Increase over", myName)
+print(xtable(peer_earnings, caption = cap), comment = FALSE)
+```
+
+
+\subsection{A Combined Model}
+In order to move things along, the next model includes all three explanatory variables. Recall that the third one is the median family income of the home state of the institution. Its effect on the outcome depends on the proportion of graduates who stay in the state after graduation. Relationships between the variables can be seen in the correlation table. 
+
+```{r correlation, include=TRUE, fig.height = 3,fig.width = 4,results = 'asis'}
+print(xtable(c, caption = "Correlations between Variables"), comment = FALSE)
+```
+
+
+
+```{r model3, include=TRUE, fig.height = 3,results = 'asis', fig.cap=paste("Graduate Income Modeled by Three Predictors.")}
+
+print(xtable(m3,digits = 2, caption = "$StudentInc \\sim ParentInc + InstEarnings + StateInc$"), comment = FALSE)
+
+ggplot(fam, aes(x = ModelEstimate, y = StudentInc, color = Category)) + geom_point(alpha = .7, size = .5) + 
+  geom_smooth(method = "lm", se = FALSE, size = .5) + theme_base() + 
+  scale_color_manual(values=c("#FF0000","#EEEEEE",  "#888888", "#0000ff"))
+```
+The addition of the two variables improves the original model considerably ($R^2$ = `r round(summary(m3)$adj.r.squared,2)`). The scatterplot now compares the model's predicted value of $StudentInc$ to the actual value. `r myName` has a residual of `r resid3`, compared to the original `r resid1`.
+
+\section{Discussion}
+Graduate incomes are potentially a lagging indicator of the success of initiatives to smooth the path from college to career. The same \textit{New York Times} article where the median earnings by major are found \cite{sixmyths} contains an assertion that liberal arts students are well-prepared for careers, but have difficulty with the transition after graduation. If so, this initial slowdown could put them behind and explain part of the liberal arts gap in incomes visible in the data; in other words, if graduates start at lower incomes than other graduates, it will be hard for them to make up that difference over the course of their career. The article also suggests programs to expand the options of liberal arts graduates by adding particular skills (e.g. data analysis, social media expertise) to their curriculum.
+
+This study is part of a larger effort to understand the transition from college to career, especially for students well-prepared in thinking and communication skills, but for whom no established major-to-career path is available. An extension of the present study is to further eliminate variance by introducing new information, and try to identify comparable institutions that are outperforming in order to understand their practices.
+
+\section{About this Report}
+This report was produced quickly, and should be considered a work in progress. The intent is that it will be shared with the higher education community as appropriate for discussion and improvement. The first draft was produced at Furman University on 11/17/2017, taking about ten hours of staff time. A public version was released on 12/2/2017.
+
+The data used in this report are all public sources, and this code is released on github with a GNU public license, meaning you can use it freely for your own purposes. It comes with no warranty of usefulness or correctness; you are on your own to ascertain its usefulness to you.
+
+If you feel moved to cite this project in a paper, please use:
+
+Eubanks, D., \& Klonis, S. (2017) Graduate Salaries, Github repository https://github.com/stanislavzza/GraduateSalaries.
+
+Contact: David Eubanks at david.eubanks\@furman.edu. 
+
+\begin{thebibliography}{9}
+
+\bibitem{addons}
+Burning Glass (2013) THE ART OF EMPLOYMENT: How Liberal Arts Graduates Can Improve Their
+Labor Market Prospects, \\\texttt{http://burning-glass.com/wp-content/uploads/BGTReportLiberalArts.pdf}
+
+\bibitem{mobility} 
+Chetty, R. Friedman, J., Saez, E., Turner, N. and Yagan, D.,(2017) Mobility Report Cards: The Role of Colleges in Intergenerational Mobility, Equality of Opportunity Project, \\\texttt{http://www.equality-of-opportunity.org/papers/coll\_mrc\_paper.pdf}, data available from \\\texttt{http://www.equality-of-opportunity.org/data/}
+
+\bibitem{nytmobility}
+New York Times (2017) Economic Diversity and Student Outcomes at America's Colleges and Universities: Find Your College, \\\texttt{https://www.nytimes.com/interactive/projects/college-mobility/}. See institional data at \\\texttt{https://www.nytimes.com/interactive/projects/college-mobility/}
+
+\bibitem{sixmyths} 
+Selinego, G. (2017) Six Myths about Choosing a College Major, \textit{The New York Times}
+\\\texttt{https://www.nytimes.com/2017/11/03/education/edlife/choosing-a-college-major.html}
+
+\bibitem{earnings}
+Weber, D. (2017) Distribution of Lifetime Earnings by Major
+\\\texttt{https://public.tableau.com/profile/douglas.webber\#\!/vizhome/LifetimeEarningsbyMajor/Sheet1}
+
+\bibitem{ipeds} 
+Integrated Postsecondary Education Data System (2017) \\\texttt{https://nces.ed.gov/ipeds/datacenter/login.aspx?gotoReportId=7}
+
+\bibitem{states}
+US Census Bureau (2017) Henry J. Kaiser Family Foundation. \\\texttt{https://www.kff.org/other/state-indicator/median-annual-income}
+
+\end{thebibliography}
